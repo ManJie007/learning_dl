@@ -192,3 +192,36 @@ if __name__ == "__main__":
 """
 tips:After xvfbrun to provide a virtual X11 display
 """
+
+"""
+In CartPole
+    every step of the environment gives us the reward 1.0, until the moment that the pole falls. 
+    So, the longer our agent balanced the pole, the more reward it obtained. 
+    Due to randomness in our agent's behavior, different episodes were of different lengths, 
+    which gave us a pretty normal distribution of the episodes' rewards. 
+    After choosing a reward boundary, we rejected less successful episodes and learned how to repeat better ones (by training on successful episodes' data).
+
+In the FrozenLake environment 
+    episodes and their reward look different. 
+    We get the reward of 1.0 only when we reach the goal, 
+    and this reward says nothing about how good each episode was.
+    The distribution of rewards for our episodes are also problematic
+        There are only two kinds of episodes possible, 
+        with zero reward (failed) and one reward (successful), 
+        and failed episodes will obviously dominate in the beginning of the training. 
+        So, our percentile selection of "elite" episodes is totally wrong and 
+        gives us bad examples to train on. 
+        This is the reason for our training failure.
+
+This example shows us the limitations of the cross-entropy methods
+|----For training, our episodes have to be finite and, preferably, short
+|----The total reward for the episodes should have enough variability to separate good episodes from bad ones
+|----There is no intermediate indication about whether the agent has succeeded or failed
+
+if you're curious about how FrozenLake can be solved using cross-entropy, here is a list of tweaks
+|----Larger batches of played episodes
+|----Discount factor applied to reward
+|----Keeping "elite" episodes for a longer time
+|----Decrease learning rate
+|----Much longer training time
+"""
