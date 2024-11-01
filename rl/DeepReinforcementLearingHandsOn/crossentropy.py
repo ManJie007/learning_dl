@@ -54,6 +54,27 @@ Steps Of The Method
 |----4. Train on the remaining "elite" episodes using observations 
 |       as the input and issued actions as the desired output.
 |----5. Repeat from step 1 until we become satisfied with the result
+
+
+Theoretical background of the crossentropy method
+The basis of the cross-entropy method lies in the importance sampling theorem
+
+In our RLcase, H(x) is a reward value obtained by some policy x and p(x) is a distribution of all possible policies. 
+
+We don't want to maximize our reward by searching all possible policies, instead we want to find a way to approximate p(x)H(x) by q(x), iteratively minimizing the distance between them.
+
+The distance between two probability distributions is calculated by KullbackLeibler (KL) divergence
+|----The first term in KL is called entropy and doesn't depend on that, so could be omitted during the minimization. 
+|----The second term is called cross-entropy and is a very common optimization objective in DL.
+
+So, the method is quite clear: 
+    we sample episodes using our current policy (starting with some random initial policy)
+    and minimize the negative log 
+    likelihood of the most successful samples and our policy
+
+There is a whole book dedicated to this method, written by Dirk P. Kroese.
+A shorter description can be found in the Cross-Entropy Method paper by
+Dirk P.Kroese (https://people.smp.uq.edu.au/DirkKroese/ps/eormsCE.pdf).
 """
 
 import torch.nn as nn
