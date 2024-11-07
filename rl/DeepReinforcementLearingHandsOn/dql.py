@@ -424,6 +424,11 @@ class ProcessFrame84(gym.ObservationWrapper):
 
 
 class ImageToPyTorch(gym.ObservationWrapper):
+    """
+    This simple wrapper changes the shape of the observation from HWC to the CHW format required by PyTorch. 
+    The input shape of the tensor has a color channel as the last dimension, 
+    but PyTorch's convolution layers assume the color channel to be the first dimension.
+    """
     def __init__(self, env):
         super(ImageToPyTorch, self).__init__(env)
         old_shape = self.observation_space.shape
@@ -435,11 +440,23 @@ class ImageToPyTorch(gym.ObservationWrapper):
 
 
 class ScaledFloatFrame(gym.ObservationWrapper):
+    """
+    1.The final wrapper we have in the library converts observation data from bytes to floats and 
+    2.scales every pixel's value to the range [0.0...1.0].
+    """
     def observation(self, obs):
         return np.array(obs).astype(np.float32) / 255.0
 
 
 class BufferWrapper(gym.ObservationWrapper):
+    """
+    This class creates a stack of subsequent frames along the first dimension and returns them as an observation. 
+
+    The purpose is to give the network an idea about the dynamics of the objects, 
+    such as the speed and direction of the ball in Pong or how enemies are moving. 
+
+    This is very important information, which it is not possible to obtain from a single image.
+    """
     def __init__(self, env, n_steps, dtype=np.float32):
         super(BufferWrapper, self).__init__(env)
         self.dtype = dtype
@@ -458,6 +475,9 @@ class BufferWrapper(gym.ObservationWrapper):
 
 
 def make_env(env_name):
+    """
+    At the end of the file is a simple function that creates an environment by its name and applies all the required wrappers to it.
+    """
     env = gym.make(env_name)
     env = MaxAndSkipEnv(env)
     env = FireResetEnv(env)
