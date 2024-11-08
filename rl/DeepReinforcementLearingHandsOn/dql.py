@@ -485,3 +485,549 @@ def make_env(env_name):
     env = ImageToPyTorch(env)
     env = BufferWrapper(env, 4)
     return ScaledFloatFrame(env)
+
+"""
+DQN Model
+
+The model published in Nature 
+    |----has three convolution layers followed by two fully connected layers.
+    |----All layers are separated by ReLU nonlinearities.
+    |----The output of the model is Q-values for every action available in the environment, without nonlinearity applied (as Q-values can have any value).
+
+The approach to have all Q-values calculated with one pass through the network helps us to increase speed significantly 
+    in comparison to treating Q(s, a) literally and feeding observations and actions to the network to obtain the value of the action.
+"""
+import torch
+import torch.nn as nn
+
+import numpy as np
+
+
+class DQN(nn.Module):
+    """
+    To be able to write our network in the generic way, it was implemented in two parts: convolution and sequential.
+    """
+    def __init__(self, input_shape, n_actions):
+        super(DQN, self).__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU()
+        )
+
+        conv_out_size = self._get_conv_out(input_shape)
+        self.fc = nn.Sequential(
+            nn.Linear(conv_out_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+
+    def _get_conv_out(self, shape):
+        """
+        _get_conv_out() 函数的确是为了解决卷积层输出大小不确定的问题而设计的。
+        在卷积神经网络中，卷积层的输出维度取决于输入的形状和卷积操作（例如卷积核的数量、大小、步幅等）。
+        这一数值将作为全连接层输入的大小，用来构造模型的全连接部分。
+        Another small problem is that we don't know the exact number of values in the output from the convolution layer produced with input of the given shape.
+        However, we need to pass this number to the first fully connected layer constructor.
+        |----One possible solution would be to hard-code this number, which is a function of input shape (for 84 × 84 input, the output from the convolution layer will have 3136 values), but it's not the best way, as our code becomes less robust to input shape change. 
+        |----The better solution would be to have a simple function (_get_conv_out()) that accepts the input shape and applies the convolution layer to a fake tensor of such a shape. 
+                The result of the function will be equal to the number of parameters returned by this application 
+        """
+        o = self.conv(torch.zeros(1, *shape))
+        return int(np.prod(o.size()))
+
+    def forward(self, x):
+        """
+        PyTorch doesn't have a 'flatter' layer which could transform a 3D tensor into a 1D vector of numbers, 
+            required to feed convolution output to the fully connected layer. 
+        This problem is solved in the forward() function, where we can reshape our batch of 3D tensors into a batch of 1D vectors.
+
+        The final piece of the model is the forward() function, which accepts the 4D input tensor
+            (the first dimension is batch size, 
+            the second is the color channel, which is our stack of subsequent frames, 
+            while the third and fourth are image dimensions).
+        """
+
+        #first we apply the convolution layer to the input and then we obtain a 4D tensor on output. 
+        #This result is flattened to have two dimensions: a batch size and all the parameters returned by the convolution for this batch entry as one long vector of numbers.
+        #这里view reshape 到 2D tensor，view 中-1表示通配符 即原纬度相乘 / x.size()[0] (batch)
+        conv_out = self.conv(x).view(x.size()[0], -1)
+        #pass this flattened 2D tensor to our fully connected layers to obtain Q-values for every batch input
+        return self.fc(conv_out)
+
+"""
+Training
+
+The third module contains the experience replay buffer, the agent, the loss function calculation, and the training loop itself.
+
+Before going into the code, something needs to be said about the training hyperparameters. 
+    |----DeepMind's Nature paper contained a table with all the details about hyperparameters used to train its model on all 49 Atari games used for evaluation. 
+    |    DeepMind kept all those parameters the same for all games (but trained individual models for every game), 
+    |    and it was the team's intention to show that the method is robust enough to solve lots of games with varying complexity, action space, reward structure, and other details using one single model architecture and hyperparameters. 
+    |
+    |----However, our goal here is much more modest: we want to solve just the Pong game.
+         Pong is quite simple and straightforward in comparison to other games in the Atari test set, 
+         so the hyperparameters in the paper are overkill for our task.
+"""
+
+#from lib import wrappers
+#from lib import dqn_model
+import argparse
+import time
+import numpy as np
+import collections
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from tensorboardX import SummaryWriter
+
+#First, we import required modules and define hyperparameters.
+DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
+MEAN_REWARD_BOUND = 19.5    #the reward boundary for the last 100 episodes to stop training.
+
+GAMMA = 0.99                #Our gamma value used for Bellman approximation
+BATCH_SIZE = 32             #The batch size sampled from the replay buffer (BATCH_SIZE)
+REPLAY_SIZE = 10000         #The maximum capacity of the buffer (REPLAY_SIZE)
+REPLAY_START_SIZE = 10000   #The count of frames we wait for before starting training to populate the replay buffer (REPLAY_START_SIZE)
+LEARNING_RATE = 1e-4        #The learning rate used in the Adam optimizer, which is used in this example
+SYNC_TARGET_FRAMES = 1000   #How frequently we sync model weights from the training model to the target model, which is used to get the value of the next state in the Bellman approximation.
+
+EPSILON_DECAY_LAST_FRAME = 10**5
+#To achieve proper exploration, at early stages of training, we start with epsilon=1.0, which causes all actions to be selected randomly.
+EPSILON_START = 1.0
+#Then, during first 100,000 frames, epsilon is linearly decayed to 0.02, which corresponds to the random action taken in 2% of steps.
+EPSILON_FINAL = 0.02
+
+Experience = collections.namedtuple('Experience', field_names=['state', 'action', 'reward', 'done', 'new_state'])
+
+class ExperienceBuffer:
+    """
+    The next chunk of the code defines our experience replay buffer, the purpose of
+    which is to keep the last transitions obtained from the environment 
+    (tuples of the observation, action, reward, done flag, and the next state).
+
+    For training, we randomly sample the batch of transitions from the replay buffer, 
+    which allows us to break the correlation between subsequent steps in the environment.
+
+    Most of the experience replay buffer code is quite straightforward: 
+    it basically exploits the capability of the deque class to maintain the given number of entries in the buffer.
+    """
+    def __init__(self, capacity):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def append(self, experience):
+        self.buffer.append(experience)
+
+    def sample(self, batch_size):
+        """
+        In the sample() method, 
+        we create a list of random indices and 
+        then repack the sampled entries into NumPy arrays for more convenient loss calculation.
+        """
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        states, actions, rewards, dones, next_states = zip(*[self.buffer[idx] for idx in indices])
+        return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), \
+               np.array(dones, dtype=np.uint8), np.array(next_states)
+
+class Agent:
+    """
+    interacts with the environment and saves the result of the interaction into the experience replay buffer
+    """
+    def __init__(self, env, exp_buffer):
+        self.env = env
+        self.exp_buffer = exp_buffer
+        self._reset()
+
+    def _reset(self):
+        self.state = env.reset()
+        self.total_reward = 0.0
+
+    def play_step(self, net, epsilon=0.0, device="cpu"):
+        """
+        The main method of the agent is to perform a step in the environment and store its result in the buffer.
+        |----1.select the action
+        |       With the probability epsilon (passed as an argument) 
+        |       we take the random action,
+        |       otherwise we use the past model to obtain the Q-values for all possible actionsand choose the best.
+        |----2.As the action has been chosen, 
+               we pass it to the environment to get the next observation and reward, 
+               store the data in the experience buffer and the handle the end-of-episode situation.
+
+        Returns:
+            The result of the function is the total accumulated reward if we've reached the end of the episode with this step, 
+            or None if not.
+        """
+        done_reward = None
+
+        if np.random.random() < epsilon:
+            action = env.action_space.sample()
+        else:
+            state_a = np.array([self.state], copy=False)
+            state_v = torch.tensor(state_a).to(device)
+            q_vals_v = net(state_v)
+            _, act_v = torch.max(q_vals_v, dim=1)
+            action = int(act_v.item())
+
+        # do step in the environment
+        new_state, reward, is_done, _ = self.env.step(action)
+        self.total_reward += reward
+
+        exp = Experience(self.state, action, reward, is_done, new_state)
+        self.exp_buffer.append(exp)
+        self.state = new_state
+        if is_done:
+            done_reward = self.total_reward
+            self._reset()
+        return done_reward
+
+def calc_loss(batch, net, tgt_net, device="cpu"):
+    """
+    calculates the loss for the sampled batch
+
+    This function is written in a form to maximally exploit GPU parallelism by processing all batch samples with vector operations, 
+    which makes it harder to understand when compared with a naive loop over the batch.
+
+    here is the loss expression we need to calculate:
+        L = (Qs, a - y) ^ 2
+
+    arguments:
+        batch 
+            |----as a tuple of arrays (repacked by the sample() method in the experience buffer), 
+        network 
+            |----that we're training 
+            |----is used to calculate gradients
+        target network
+            |----which is periodically synced with the trained one.   
+            |----is used to calculate values for the next states and this calculation shouldn't affect gradients.
+                    To achieve this, we're using the detach() function of the PyTorch tensor to prevent gradients from flowing into the target network's graph. 
+                    This function was described in Chapter 3, Deep Learning with PyTorch.
+    """
+    states, actions, rewards, dones, next_states = batch
+
+    states_v = torch.tensor(states).to(device)
+    next_states_v = torch.tensor(next_states).to(device)
+    actions_v = torch.tensor(actions).to(device)
+    rewards_v = torch.tensor(rewards).to(device)
+    done_mask = torch.ByteTensor(dones).to(device)
+
+    """
+    we pass observations to the first model and extract the specific Q-values for the taken actions using the gather() tensor operation.
+        gather()
+            The first argument to the gather() call 
+                is a dimension index that we want to perform gathering on (in our case it is equal to 1, which corresponds to actions).
+            The second argument is a tensor of indices of elements to be chosen.
+            the result of gather() applied to tensors is a differentiable operation, which will keep all gradients with respect to the final loss value.
+
+        Extra unsqueeze() and squeeze() calls 
+            are required to fulfill the requirements of the gather functions to the index argument and 
+            to get rid of extra dimensions that we created (the index should have the same number of dimensions as the data we're processing). 
+
+        In the following image, you can see an illustration of what gather does on the example case, with a batch of six entries and four actions.
+                                                                                                                                                                                                                                                                                                            
+                            :                           actions
+                        .!YBB^:::::::::::::::::::...::..::.:.:...:.::::..:::::::::::::::::::.Y#57:                                                                                                                                                                                                          
+                        :?G&#~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^:5@BY^                                                                                                                                                                                                          
+                           :^                                                                ^^                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                                            
+                                                                                                                                                                                                                                                                                                            
+             ^         .!~~~~~~~~~~~~~~~~^7!~~~~~~~~~~~~~~~~~7^~~~~~~~~~~~~~~~~7~~~~~~~~~~~~~~~~~!:                          :!~~~~~~~~~~~~~~~~~!                           ::::::::::::::::::^::::::::::::::::::^:::::::::::::::::::::::::::::::::::::                           :::::::::::::::::::.      
+           .Y@5.       .?                 J~                ^?                .Y:                !!                          ~7                .J.                          JP5555555555555555P?::::::::::::::::^Y^::::::::::::::::J7::::::::::::::::^?                          .P55555555555555555P^      
+           ?B#BJ.      .?                 ?^                ^?                 J:                ~!                          ^7      .~~^       ?.                          J5YYYYYYYYYYYYYYYYP7                .J.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!     .J:.7~      ?.                          J5YYYYYYYYYYYYYYYYP7                .J.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!     .J:.7~      ?.                          J5YYYYYYYYYYYYYYYYP7                .J.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      .^~:       ?.                          J5YYYYYYYYYYYYYYYYP7                .J.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!                 ?.                          J5YYYYYYYYYYYYYYYYP!                .J                 7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .Y~~~~~~~~~~~~~~~~~Y7~~~~~~~~~~~~~~~~7Y~~~~~~~~~~~~~~~~~5!~~~~~~~~~~~~~~~~?!                          ^J~~~~~~~~~~~~~~~~~Y.                          YP5555555555555555G?::::::::::::::::^Y^::::::::::::::::J7::::::::::::::::^?                          .P55555555555555555P^      
+             ?.        .?.................?~................~?.................J:................!!                          ^7.................?.                          J!^^^^^^^^^^^^^^^^?J^^^^^^^^^^^^^^^^~5~^^^^^^^^^^^^^^^^JP55555555555555555J                          .P55555555555555555P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      :^^:       ?.                          ?.                ~7                .J                 7P5YYYYYYYYYYYYYYY5J                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      ^^~J.      ?.                          ?:                ~7                .J.                7P5YYYYYYYYYYYYYYY5J                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!     .^^~J^      ?.                          ?:                ~7                .J.                7P5YYYYYYYYYYYYYYY5J                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      ^^^^.      ?.                          ?:                ~7                .J.                7P5YYYYYYYYYYYYYYY5J                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!                 ?.                          ?.                ~7                .J.                7PYYYYYYYYYYYYYYYY5J                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .J~~~~~~~~~~~~~~~~^Y7^~~~~~~~~~~~~~~^7Y^~~~~~~~~~~~~~~~~5!~~~~~~~~~~~~~~~^?!                          ^J^~~~~~~~~~~~~~~~~J.                          ?^:::::::::::::::.7?.:::::::::::::::^Y:.:::::::::::::..?P5555555555555555PJ                          .P55555555555555555P^      
+             ?.        .J.................J~................~J................:Y^................!!                          ^7................:J.                          J!^^^^^^^^^^^^^^^^?J^^^^^^^^^^^^^^^^~P5555555555555555YG?~~~~~~~~~~~~~~~~!J                          .P55555555555555555P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      .^^:       ?.                          ?.                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      !::J:      ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      .~7~       ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      !7~~.      ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!                 ?.                .~:       ?.                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+  batch      ?.        .J^^^^^^^^^^^^^^^^^Y7^^^^^^^^^^^^^^^^7Y^^^^^^^^^^^^^^^^^5!^^^^^^^^^^^^^^^^?!                          ^?^^^^^^^^^^^^^^^^~J.   .^^^^^^^^^^^^~&@G?:    ?^................!7................:555555555555555555G!................^?    .............~B57:    .P55555555555555555P^      
+             ?.        .J::::::::::::::::.J!.::::::::::::::.~J.::::::::::::::::Y^:::::::::::::::.7!                          ^7.:::::::.::::::::J.   .............^BGJ~.    J!~~~~~~~~~~~~~~~^?PYYYYYYYYYYYYYYYY5P!!!!!!!!!!!!!!!!~Y?^~~~~~~~~~~~~~~~!J    :^^^^^^^^^^^^7@@G?.   .P55555555555555555P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!       .:        ?.                 .        ?.                ~P5Y5YYYYYYYYY55YY55                 7~                .?                 .!:      .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      :!5.       ?.                          ?:                ~PYYYYYYYYYYYYYYYY55.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!       .Y.       ?.                          ?:                ~PYYYYYYYYYYYYYYYY55.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      :~?~:      ?.                          ?:                ~PYYYYYYYYYYYYYYYY55.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!                 ?.                          ?.                ~PYYYYYYYYYYYYYYYY55                 7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .J^^^^^^^^^^^^^^^^^Y!^^^^^^^^^^^^^^^^!J^^^^^^^^^^^^^^^^^Y~^^^^^^^^^^^^^^^^7!                          ^?^^^^^^^^^^^^^^^^^J.                          ?:................~P555555555555555555................ ?!................:?                          .P55555555555555555P^      
+             ?.        .J:::::::::::::::::J!::::::::::::::::!J:::::::::::::::::Y~::::::::::::::::7!                          ^?:::::::::::::::::J.                          J!~~~~~~~~~~~~~~~~?GPPPPPPPPPPPPPPPPPP~~~~~~~~~~~~~~~~~Y?~~~~~~~~~~~~~~~~!J                          .PPPPPPPPPPPPPPPPPPG^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!        :        ?.                          ?.                ~PYYYYYYYYYYYYYYYY55                 7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      :!5.       ?.                          ?:                ~PYYYYYYYYYYYYYYYY55.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!       .Y.       ?.                          ?:                ~PYYYYYYYYYYYYYYYY55.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      ^!?~:      ?.                          ?:                ~PYYYYYYYYYYYYYYYY55.                7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!                 ?.                          ?.                ~PYYYYYYYYYYYYYYYY55                 7~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .J^^^^^^^^^^^^^^^^:J!^^^^^^^^^^^^^^^:!J:^^^^^^^^^^^^^^^^Y~^^^^^^^^^^^^^^^:7!                          ^?:^^^^^^^^^^^^^^^^J.                          ?:                ~P555555555555555555.                7!                :?                          .P5Y555555555555555P^      
+             ?.        .J:^^^^^^^^^^^^^^^:J!:^^^^^^^^^^^^^^:!J:^^^^^^^^^^^^^^^^Y~:^^^^^^^^^^^^^^:7!                          ^?:^^^^^^::^^^^^^^^J.                          J!^~~~~~~~~~~~~~~^?Y7777777777777777?PJJJJJJJJJJJJJJJJJP?^~~~~~~~~~~~~~~^!J                          .PPPPPPPPPPPPPPPPPPG^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!       ..        ?.                          ?.                ~7                .555555555555555555G~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      !~^?:      ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+             ?.        .?                 ?^                ^?                 J:                ~!                          ^!      ..~7.      ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+           ^^Y^^.      .?                 ?^                ^?                 J:                ~!                          ^!      !J7~.      ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+           7&@&?       .?                 ?^                ^?                 J:                ~!                          ^!                 ?.                          ?:                ~7                .55YYYYYYYYYYYYYYYYG~                .?                          .P5YYYYYYYYYYYYYYY5P^      
+            !B7        .J:::::::::::::::::J!::::::::::::::::~J:::::::::::::::::Y^::::::::::::::::7!                          ^7:::::::::::::::::J.                          ?:                !7                .555555555555555555G~                :?                          .P55555555555555555P^      
+             .          :^^^^^^^^^^^^^^^^:^^^^^^^^^^^^^^^^^^^^::^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^:^.                          .^^^^^^^^^^^^^^^^^^:                           !!~~~~~~~~~~~~~~~~77~~~~~~~~~~~~~~~~!??????????????????J!~~~~~~~~~~~~~~~~!!                           ???????????????????:      
+                                                    Out put of model                                                           Action takens                                                           Selected g-values                                                           Result of gather                
+    """
+    state_action_values = net(states_v).gather(1, actions_v.unsqueeze(-1)).squeeze(-1)
+    """
+    we apply the target network to our next state observations and calculate the maximum Q-value along the same action dimension 1.
+    max(1) 表示在动作维度（第 1 维）上找出最大值。对于每个状态，都会找到该状态下所有动作的最大 Q 值。
+    max(1) 函数不仅返回最大值，还返回最大值的索引（类似 argmax）。所以结果是一个包含两个元素的元组：
+        第一个元素是最大 Q 值；
+        第二个元素是对应的动作索引。
+        由于我们只关心最大 Q 值，不关心具体的动作索引，所以只取第一个元素 [0]，即 max(1)[0]。
+    """
+    next_state_values = tgt_net(next_states_v).max(1)[0]
+    """
+    if transition in the batch is from the last step in the episode, 
+    then our value of the action doesn't have a discounted reward of the next state, 
+    as there is no next state to gather reward from.
+
+    without this, training will not converge.!!!
+    """
+    next_state_values[done_mask] = 0.0
+    """
+    In this line, we detach the value from its computation graph to prevent gradients from flowing into the neural network used to calculate Q approximation for next states.
+
+    This is important, as without this our backpropagation of the loss will start to affect both predictions for the current state and the next state.
+        However, we don't want to touch predictions for the next state, as they're used in the Bellman equation to calculate reference Qvalues. 
+
+    To block gradients from flowing into this branch of the graph, we're using the detach() method of the tensor, which returns the tensor without connection to its calculation history.
+    """
+    next_state_values = next_state_values.detach()
+
+    #we calculate the Bellman approximation value and the mean squared error loss.
+    expected_state_action_values = next_state_values * GAMMA + rewards_v
+    """
+    使用均方误差（MSE）损失函数来计算并返回当前 Q 值与目标 Q 值之间的差异
+    该损失值用于指导模型更新参数，减小当前 Q 值与目标 Q 值之间的差距，从而改进策略。
+    这是 Q-learning 的核心目标，即让模型学习到越来越接近最优策略的 Q 值函数。
+    """
+    return nn.MSELoss()(state_action_values, expected_state_action_values)
+
+#This ends our loss function calculation, and the rest of the code is our training loop.
+
+if __name__ == "__main__":
+    """
+    we create a parser of command-line arguments.
+        Our script allows us to enable CUDA and train on environments that are different from the default.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cuda", default=False, action="store_true", help="Enable cuda")
+    parser.add_argument("--env", default=DEFAULT_ENV_NAME,
+                        help="Name of the environment, default=" + DEFAULT_ENV_NAME)
+    parser.add_argument("--reward", type=float, default=MEAN_REWARD_BOUND,
+                        help="Mean reward boundary for stop of training, default=%.2f" % MEAN_REWARD_BOUND)
+    args = parser.parse_args()
+    device = torch.device("cuda" if args.cuda else "cpu")
+
+    # env = wrappers.make_env(args.env)
+    env = make_env(args.env)
+
+    """
+    Here we create our environment with all required wrappers applied, the neural network we're going to train, and our target network with the same architecture. 
+    In the beginning, they'll be initialized with different random weights, 
+    but it doesn't matter much as we'll sync them every 1k frames, 
+    which roughly corresponds to one episode of Pong
+    """
+    # net = dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device)
+    # tgt_net = dqn_model.DQN(env.observation_space.shape, env.action_space.n).to(device)
+    net = DQN(env.observation_space.shape, env.action_space.n).to(device)
+    tgt_net = DQN(env.observation_space.shape, env.action_space.n).to(device)
+    writer = SummaryWriter(comment="-" + args.env)
+    print(net)
+
+    buffer = ExperienceBuffer(REPLAY_SIZE)
+    agent = Agent(env, buffer)
+    epsilon = EPSILON_START #Epsilon is initially initialized to 1.0, but will be decreased every iteration.
+
+    optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
+    total_rewards = []
+    frame_idx = 0
+    ts_frame = 0
+    ts = time.time()
+    best_mean_reward = None #Every time our mean reward beats the record, we'll save the model in the file.
+
+    while True:
+        frame_idx += 1
+        """
+        At the beginning of the training loop, we count the number of iterations completed and decrease epsilon according to our schedule. 
+        Epsilon will drop linearly during the given number of frames (EPSILON_DECAY_LAST_FRAME=100k) and then will be kept on the same level of EPSILON_FINAL=0.02.
+        """
+        epsilon = max(EPSILON_FINAL, EPSILON_START - frame_idx / EPSILON_DECAY_LAST_FRAME)
+
+        reward = agent.play_step(net, epsilon, device=device)
+        if reward is not None:
+            """
+            play_step()
+            This function returns a nonNone result only if this step is the final step in the episode.
+            In that case, we report our progress. Specifically, we calculate and show, both in the console and in TensorBoard, these values:
+            |----Speed as a count of frames processed per second
+            |----Count of episodes played
+            |----Mean reward for the last 100 episodes
+            |----Current value for epsilon
+            """
+            total_rewards.append(reward)
+            speed = (frame_idx - ts_frame) / (time.time() - ts)
+            ts_frame = frame_idx
+            ts = time.time()
+            mean_reward = np.mean(total_rewards[-100:])
+            print("%d: done %d games, mean reward %.3f, eps %.2f, speed %.2f f/s" % (
+                frame_idx, len(total_rewards), mean_reward, epsilon,
+                speed
+            ))
+            writer.add_scalar("epsilon", epsilon, frame_idx)
+            writer.add_scalar("speed", speed, frame_idx)
+            writer.add_scalar("reward_100", mean_reward, frame_idx)
+            writer.add_scalar("reward", reward, frame_idx)
+            if best_mean_reward is None or best_mean_reward < mean_reward:
+                """
+                Every time our mean reward for the last 100 episodes reaches a maximum, we report this and save the model parameters. 
+                """
+                torch.save(net.state_dict(), args.env + "-best.dat")
+                if best_mean_reward is not None:
+                    print("Best mean reward updated %.3f -> %.3f, model saved" % (best_mean_reward, mean_reward))
+                best_mean_reward = mean_reward
+            if mean_reward > args.reward:
+                """
+                 If our mean reward exceeds the specified boundary, then we stop training.
+                """
+                print("Solved in %d frames!" % frame_idx)
+                break
+
+        if len(buffer) < REPLAY_START_SIZE:
+            """
+            Here we check whether our buffer is large enough for training. 
+            In the beginning, we should wait for enough data to start, which in our case is 10k transitions.
+            """
+            continue
+
+        if frame_idx % SYNC_TARGET_FRAMES == 0:
+            """
+            The next condition syncs parameters from our main network to the target net every SYNC_TARGET_FRAMES, which is 1k by default.
+            """
+            tgt_net.load_state_dict(net.state_dict())
+
+        """
+        The last piece of the training loop is very simple, but requires the most time to execute: 
+        |----we zero gradients, 
+        |----sample data batches from the experience replay buffer, 
+        |----calculate loss, and 
+        |----perform the optimization step to minimize the loss.
+        """
+        optimizer.zero_grad()
+        batch = buffer.sample(BATCH_SIZE)
+        loss_t = calc_loss(batch, net, tgt_net, device=device)
+        loss_t.backward()
+        optimizer.step()
+    writer.close()
+
+"""
+In the next chapter, we'll look at various approaches, found by researchers since 2015, 
+which can help to increase both training speed and data efficienc
+"""
+
+"""
+Your model in action
+
+we have a program which can load this model file and play one episode, displaying the model's dynamics.
+The code is very simple, but seeing how several matrices, with a million parameters, play Pong with superhuman accuracy, by observing only the pixels, can be like magic.
+"""
+import gym
+import time
+import argparse
+import numpy as np
+
+import torch
+
+from lib import wrappers
+from lib import dqn_model
+
+import collections
+
+DEFAULT_ENV_NAME = "PongNoFrameskip-v4"
+FPS = 25    #The preceding FPS parameter specifies the approximate speed of the shown frames.
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-m", "--model", required=True, help="Model file to load")
+    parser.add_argument("-e", "--env", default=DEFAULT_ENV_NAME,
+                        help="Environment name to use, default=" + DEFAULT_ENV_NAME)
+    """
+    Additionally, you can pass option -r with the name of a non existent directory, 
+    which will be used to save a video of your game (using the Monitor wrapper).
+    """
+    parser.add_argument("-r", "--record", help="Directory to store video recording")
+    parser.add_argument("--no-visualize", default=True, action='store_false', dest='visualize',
+                        help="Disable visualization of the game play")
+    args = parser.parse_args()
+
+    env = wrappers.make_env(args.env)
+    if args.record:
+        env = gym.wrappers.Monitor(env, args.record)
+    net = dqn_model.DQN(env.observation_space.shape, env.action_space.n)
+    """
+    load weights from the file passed in the arguments.
+    """
+    net.load_state_dict(torch.load(args.model, map_location=lambda storage, loc: storage))
+
+    state = env.reset()
+    total_reward = 0.0
+    c = collections.Counter()
+
+    while True:
+        """
+        This is almost an exact copy of Agent class' method play_step() from the training code, with the lack of epsilon-greedy action selection.
+
+        We just pass our observation to the agent and select the action with maximum value.
+        """
+        start_ts = time.time()
+        if args.visualize:
+            env.render()
+        state_v = torch.tensor(np.array([state], copy=False))
+        q_vals = net(state_v).data.numpy()[0]
+        action = np.argmax(q_vals)
+        c[action] += 1
+        state, reward, done, _ = env.step(action)
+        total_reward += reward
+        if done:
+            break
+        if args.visualize:
+            delta = 1/FPS - (time.time() - start_ts)
+            if delta > 0:
+                time.sleep(delta)
+    print("Total reward: %.2f" % total_reward)
+    print("Action counts:", c)
+    if args.record:
+        env.env.close()
+
+"""
+Summary
+
+We became familiar with the limitations of value iteration in complex environments with large observation spaces and discussed how to overcome them with Qlearning. 
+
+We checked the Q-learning algorithm on the FrozenLake environment and discussed the approximation of Q-values with neural networks and the extra complications that arise from this approximation. 
+
+We covered several tricks for DQNs to improve their training stability and convergence, such as experience replay buffer, target networks, and frame stacking. 
+
+In the next chapter, we'll look at a set of tricks that researchers have found, since 2015, to improve DQN convergence and quality, which (combined) can produce state-of-the-art results on most of the 54 Atari games. 
+This set was published in 2017 and we'll analyze and reimplement all of the tricks.
+"""
